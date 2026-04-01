@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,15 +29,32 @@ var (
 	senderAddrID string        // アドレスID
 
 	// 送信レート制限
-	sendMu        sync.Mutex
-	sendCount     int
+	sendMu          sync.Mutex
+	sendCount       int
 	sendWindowStart time.Time
+
+	// 送信確認トークン（C1対策: サーバー側でのconfirm検証）
+	pendingMu    sync.Mutex
+	pendingSends map[string]*pendingSend // token -> send params
 )
+
+type pendingSend struct {
+	to      string
+	cc      string
+	subject string
+	body    string
+	created time.Time
+}
 
 const (
 	maxSendsPerWindow = 5               // ウィンドウ内の最大送信数
 	sendWindow        = 10 * time.Minute // レート制限ウィンドウ
+	tokenExpiry       = 5 * time.Minute  // 確認トークンの有効期限
 )
+
+func init() {
+	pendingSends = make(map[string]*pendingSend)
+}
 
 func main() {
 	s := server.NewMCPServer(
@@ -72,14 +91,18 @@ func main() {
 		mcp.WithNumber("limit", mcp.Description("取得件数 (デフォルト: 20)")),
 	), searchMessagesHandler)
 
-	s.AddTool(mcp.NewTool("protonmail_send_message",
-		mcp.WithDescription("メールを送信する。confirm=trueを指定しない場合はプレビューのみ（実際には送信されない）。安全のため、ユーザーの明示的な承認を得てからconfirm=trueで再度呼び出すこと。"),
+	s.AddTool(mcp.NewTool("protonmail_send_preview",
+		mcp.WithDescription("メール送信のプレビューを生成する。実際には送信されない。確認トークンが返されるので、ユーザーの明示的な承認後に protonmail_send_confirm で送信すること。"),
 		mcp.WithString("to", mcp.Required(), mcp.Description("宛先メールアドレス（カンマ区切りで複数可）")),
 		mcp.WithString("subject", mcp.Required(), mcp.Description("件名")),
 		mcp.WithString("body", mcp.Required(), mcp.Description("本文（プレーンテキスト）")),
 		mcp.WithString("cc", mcp.Description("CCメールアドレス（カンマ区切り）")),
-		mcp.WithBoolean("confirm", mcp.Description("trueで実際に送信。省略またはfalseではプレビューのみ。ユーザーの明示的な承認なしにtrueを設定してはならない。")),
-	), sendMessageHandler)
+	), sendPreviewHandler)
+
+	s.AddTool(mcp.NewTool("protonmail_send_confirm",
+		mcp.WithDescription("プレビュー済みメールを実際に送信する。protonmail_send_preview で取得した confirm_token が必須。トークンは5分間有効。"),
+		mcp.WithString("confirm_token", mcp.Required(), mcp.Description("protonmail_send_preview で発行された確認トークン")),
+	), sendConfirmHandler)
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatal(err)
@@ -113,9 +136,11 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 
 	if auth.TwoFA.Enabled&proton.HasTOTP != 0 {
 		if totp == "" {
+			c.Close()
 			return mcp.NewToolResultError("2FAが有効です。totp パラメータに認証コードを指定してください。"), nil
 		}
 		if err := c.Auth2FA(ctx, proton.Auth2FAReq{TwoFactorCode: totp}); err != nil {
+			c.Close()
 			return mcp.NewToolResultError(fmt.Sprintf("2FA認証失敗: %v", err)), nil
 		}
 	}
@@ -143,6 +168,12 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 
 	ukr, akrs, err := proton.Unlock(user, addrs, saltedKeyPass)
+
+	// C2対策: saltedKeyPassを即座にゼロ埋め
+	for i := range saltedKeyPass {
+		saltedKeyPass[i] = 0
+	}
+
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("キーリングアンロック失敗: %v", err)), nil
 	}
@@ -316,7 +347,7 @@ func searchMessagesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	return mcp.NewToolResultText(string(out)), nil
 }
 
-func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if protonClient == nil {
 		return mcp.NewToolResultError("未ログインです。先に protonmail_login を実行してください。"), nil
 	}
@@ -328,34 +359,77 @@ func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	subject := stringArg(req, "subject")
 	body := stringArg(req, "body")
 	cc := stringArg(req, "cc")
-	confirm := boolArg(req, "confirm")
 
 	if to == "" || subject == "" || body == "" {
 		return mcp.NewToolResultError("to, subject, body は必須です。"), nil
 	}
 
-	toList := parseAddresses(to)
-	ccList := parseAddresses(cc)
+	// 確認トークンを生成して保存
+	token, err := generateToken()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("トークン生成失敗: %v", err)), nil
+	}
 
-	// confirm=false ならプレビューのみ
-	if !confirm {
-		preview := map[string]interface{}{
-			"mode":    "プレビュー（未送信）",
-			"from":    formatMailAddress(senderAddr),
-			"to":      to,
-			"cc":      cc,
-			"subject": subject,
-			"body":    body,
-			"_notice": "これはプレビューです。実際に送信するには、ユーザーの承認を得た上で confirm=true を指定して再度呼び出してください。",
-		}
-		out, _ := json.MarshalIndent(preview, "", "  ")
-		return mcp.NewToolResultText(string(out)), nil
+	pendingMu.Lock()
+	// 期限切れトークンを掃除
+	cleanExpiredTokens()
+	pendingSends[token] = &pendingSend{
+		to:      to,
+		cc:      cc,
+		subject: subject,
+		body:    body,
+		created: time.Now(),
+	}
+	pendingMu.Unlock()
+
+	preview := map[string]interface{}{
+		"mode":          "プレビュー（未送信）",
+		"from":          formatMailAddress(senderAddr),
+		"to":            to,
+		"cc":            cc,
+		"subject":       subject,
+		"body":          body,
+		"confirm_token": token,
+		"expires_in":    fmt.Sprintf("%d分", int(tokenExpiry.Minutes())),
+		"_notice":       "これはプレビューです。実際に送信するには、ユーザーの承認を得た上で protonmail_send_confirm に confirm_token を渡してください。",
+	}
+	out, _ := json.MarshalIndent(preview, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
+}
+
+func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if protonClient == nil {
+		return mcp.NewToolResultError("未ログインです。先に protonmail_login を実行してください。"), nil
+	}
+
+	token := stringArg(req, "confirm_token")
+	if token == "" {
+		return mcp.NewToolResultError("confirm_token は必須です。"), nil
+	}
+
+	// トークンを検証して取り出す（1回限り）
+	pendingMu.Lock()
+	pending, ok := pendingSends[token]
+	if ok {
+		delete(pendingSends, token)
+	}
+	pendingMu.Unlock()
+
+	if !ok {
+		return mcp.NewToolResultError("無効または期限切れの確認トークンです。protonmail_send_preview からやり直してください。"), nil
+	}
+
+	if time.Since(pending.created) > tokenExpiry {
+		return mcp.NewToolResultError("確認トークンの有効期限が切れています。protonmail_send_preview からやり直してください。"), nil
 	}
 
 	// レート制限チェック
 	if err := checkSendRateLimit(); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+
+	toList := parseAddresses(pending.to)
+	ccList := parseAddresses(pending.cc)
 
 	addrKR, ok := addrKRs[senderAddrID]
 	if !ok {
@@ -365,11 +439,11 @@ func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	// 1. ドラフト作成
 	draft, err := protonClient.CreateDraft(ctx, addrKR, proton.CreateDraftReq{
 		Message: proton.DraftTemplate{
-			Subject:  subject,
+			Subject:  pending.subject,
 			Sender:   senderAddr,
 			ToList:   toList,
 			CCList:   ccList,
-			Body:     body,
+			Body:     pending.body,
 			MIMEType: rfc822.TextPlain,
 		},
 	})
@@ -378,13 +452,14 @@ func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	}
 
 	// 2. 各宛先のSendPreferencesを構築
-	allRecipients := append(toList, ccList...)
+	allRecipients := make([]*mail.Address, 0, len(toList)+len(ccList))
+	allRecipients = append(allRecipients, toList...)
+	allRecipients = append(allRecipients, ccList...)
 	prefs := make(map[string]proton.SendPreferences)
 
 	for _, rcpt := range allRecipients {
 		pubKeys, recipientType, err := protonClient.GetPublicKeys(ctx, rcpt.Address)
 		if err != nil || recipientType != proton.RecipientTypeInternal || len(pubKeys) == 0 {
-			// 外部宛先: 暗号化なし（ClearScheme）
 			prefs[rcpt.Address] = proton.SendPreferences{
 				Encrypt:          false,
 				SignatureType:    proton.NoSignature,
@@ -392,7 +467,6 @@ func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 				MIMEType:         rfc822.TextPlain,
 			}
 		} else {
-			// Proton内部宛先: 暗号化あり
 			recipientKR, err := pubKeys.GetKeyRing()
 			if err != nil {
 				prefs[rcpt.Address] = proton.SendPreferences{
@@ -415,7 +489,7 @@ func sendMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	// 3. 送信パッケージを構築
 	var sendReq proton.SendDraftReq
-	if err := sendReq.AddTextPackage(addrKR, body, rfc822.TextPlain, prefs, nil); err != nil {
+	if err := sendReq.AddTextPackage(addrKR, pending.body, rfc822.TextPlain, prefs, nil); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("送信パッケージ構築失敗: %v", err)), nil
 	}
 
@@ -458,6 +532,25 @@ func parseAddresses(s string) []*mail.Address {
 
 // --- security ---
 
+// generateToken creates a cryptographically random confirmation token.
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// cleanExpiredTokens removes expired pending sends. Must be called with pendingMu held.
+func cleanExpiredTokens() {
+	now := time.Now()
+	for token, ps := range pendingSends {
+		if now.Sub(ps.created) > tokenExpiry {
+			delete(pendingSends, token)
+		}
+	}
+}
+
 // sanitizeEmailBody wraps email content with injection defense markers.
 func sanitizeEmailBody(body string) string {
 	return "--- BEGIN EMAIL CONTENT (external, untrusted) ---\n" +
@@ -492,15 +585,6 @@ func stringArg(req mcp.CallToolRequest, key string) string {
 	v, ok := args[key].(string)
 	if !ok {
 		return ""
-	}
-	return v
-}
-
-func boolArg(req mcp.CallToolRequest, key string) bool {
-	args := req.GetArguments()
-	v, ok := args[key].(bool)
-	if !ok {
-		return false
 	}
 	return v
 }
