@@ -21,7 +21,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// session はログインセッションの状態を保持する。全フィールドは sessionMu で保護する。
+// session はログインセッションの状態を保持する。
+// sessionMu で保護し、refcount で使用中のハンドラがある間は Close されない。
 type session struct {
 	client   *proton.Client
 	mgr      *proton.Manager
@@ -29,6 +30,8 @@ type session struct {
 	addrKRs  map[string]*crypto.KeyRing
 	addr     *mail.Address
 	addrID   string
+	refs     sync.WaitGroup
+	closed   bool
 }
 
 var (
@@ -121,24 +124,45 @@ func main() {
 	}
 }
 
-// getSession はセッションを安全に取得する。未ログインならエラーを返す。
-func getSession() (*session, error) {
+// acquireSession はセッションを安全に取得し、参照カウントを増やす。
+// 使用後は必ず releaseSession を呼ぶこと。
+func acquireSession() (*session, error) {
 	sessionMu.RLock()
 	s := sess
+	if s != nil && !s.closed {
+		s.refs.Add(1)
+	} else {
+		s = nil
+	}
 	sessionMu.RUnlock()
-	if s == nil || s.client == nil {
+	if s == nil {
 		return nil, fmt.Errorf("未ログインです。先に protonmail_login を実行してください。")
 	}
 	return s, nil
 }
 
-// closeSession は既存セッションを安全にクローズする。sessionMu を取得して呼ぶこと。
+// releaseSession は参照カウントを減らす。
+func releaseSession(s *session) {
+	s.refs.Done()
+}
+
+// closeSession は既存セッションを安全にクローズする。sessionMu.Lock() を保持して呼ぶこと。
+// 全ハンドラがセッションを解放するまで待ってからクローズする。
 func closeSession() {
 	if sess != nil {
-		if sess.client != nil {
-			sess.client.Close()
-		}
+		sess.closed = true
+		old := sess
 		sess = nil
+		// ロックを一時解放して待機（デッドロック防止）
+		sessionMu.Unlock()
+		old.refs.Wait()
+		sessionMu.Lock()
+		if old.client != nil {
+			old.client.Close()
+		}
+		if old.mgr != nil {
+			old.mgr.Close()
+		}
 	}
 }
 
@@ -248,10 +272,11 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 }
 
 func listMessagesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	s, err := getSession()
+	s, err := acquireSession()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	defer releaseSession(s)
 
 	folder := stringArg(req, "folder")
 	if folder == "" {
@@ -293,10 +318,11 @@ func listMessagesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func readMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	s, err := getSession()
+	s, err := acquireSession()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	defer releaseSession(s)
 
 	msgID := stringArg(req, "message_id")
 	if msgID == "" {
@@ -344,10 +370,11 @@ func readMessageHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 }
 
 func searchMessagesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	s, err := getSession()
+	s, err := acquireSession()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	defer releaseSession(s)
 
 	senderFilter := strings.ToLower(stringArg(req, "sender"))
 	subject := stringArg(req, "subject")
@@ -404,10 +431,11 @@ func searchMessagesHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 }
 
 func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	s, err := getSession()
+	s, err := acquireSession()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	defer releaseSession(s)
 	if s.addr == nil {
 		return mcp.NewToolResultError("送信者アドレスが未設定です。再ログインしてください。"), nil
 	}
@@ -463,10 +491,11 @@ func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 }
 
 func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	s, err := getSession()
+	s, err := acquireSession()
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	defer releaseSession(s)
 
 	token := stringArg(req, "confirm_token")
 	if token == "" {
@@ -487,6 +516,11 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	if time.Since(pending.created) > tokenExpiry {
 		return mcp.NewToolResultError("確認トークンの有効期限が切れています。protonmail_send_preview からやり直してください。"), nil
+	}
+
+	// N8対策: レート制限チェック
+	if err := checkSendRateLimit(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	toList := parseAddresses(pending.to)
@@ -551,12 +585,16 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	// 3. 送信パッケージを構築
 	var sendReq proton.SendDraftReq
 	if err := sendReq.AddTextPackage(addrKR, pending.body, rfc822.TextPlain, prefs, nil); err != nil {
+		// N12対策: ドラフトをクリーンアップ
+		_ = s.client.DeleteMessage(ctx, draft.ID)
 		return mcp.NewToolResultError(fmt.Sprintf("送信パッケージ構築失敗: %v", err)), nil
 	}
 
 	// 4. 送信
 	sent, err := s.client.SendDraft(ctx, draft.ID, sendReq)
 	if err != nil {
+		// N12対策: ドラフトをクリーンアップ
+		_ = s.client.DeleteMessage(ctx, draft.ID)
 		return mcp.NewToolResultError(fmt.Sprintf("送信失敗: %v", err)), nil
 	}
 
@@ -589,14 +627,17 @@ func parseAddresses(s string) []*mail.Address {
 		}
 		addr, err := mail.ParseAddress(part)
 		if err != nil {
-			// メールアドレスとして最低限の@を含むか検証
-			if strings.Contains(part, "@") {
-				addrs = append(addrs, &mail.Address{Address: part})
+			// mail.ParseAddress は "user@example.com" 形式を受け付けないことがあるので
+			// bare address として再試行（ただしCRLF等の危険文字は拒否）
+			if strings.ContainsAny(part, "\r\n") {
+				continue
 			}
-			// 不正なアドレスは無視
-		} else {
-			addrs = append(addrs, addr)
+			addr, err = mail.ParseAddress("<" + part + ">")
+			if err != nil {
+				continue // 不正なアドレスは無視
+			}
 		}
+		addrs = append(addrs, addr)
 	}
 	return addrs
 }
