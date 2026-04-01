@@ -108,7 +108,7 @@ Search messages by sender, subject, or keyword.
 
 ### `protonmail_send_message`
 
-Send an email.
+Send an email. **Requires explicit confirmation** — without `confirm: true`, only a preview is returned.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
@@ -116,6 +116,7 @@ Send an email.
 | `subject` | Yes | Subject line |
 | `body` | Yes | Plain text body |
 | `cc` | No | CC recipient(s), comma-separated |
+| `confirm` | No | `true` to actually send. Default: preview only |
 
 ## How It Works
 
@@ -123,6 +124,24 @@ Send an email.
 2. **Key management**: User's PGP private key is decrypted locally with the mailbox password
 3. **Reading**: Encrypted message bodies are decrypted with the user's keyring via `gopenpgp`
 4. **Sending**: Messages are encrypted with recipient's public key (Proton-to-Proton) or sent in clear (external)
+
+## Security Measures
+
+### Prompt Injection Defense
+
+Email content from `protonmail_read_message` is wrapped with untrusted-content markers and includes a warning instructing the AI not to follow instructions found in email bodies. This mitigates prompt injection attacks where a malicious email tries to trick the AI into sending emails or performing other actions.
+
+### Send Confirmation (Dry-Run by Default)
+
+`protonmail_send_message` returns a **preview** by default. The email is only sent when `confirm: true` is explicitly set. This prevents accidental or AI-initiated sends without user approval.
+
+### Rate Limiting
+
+Sending is limited to 5 emails per 10-minute window to prevent abuse in case of automated loops.
+
+### Credential Handling
+
+Credentials are passed via environment variables and never written to disk by this tool. For production use, consider integrating with a secret manager (`pass`, OS keyring, etc.) instead of storing passwords in `.mcp.json`.
 
 ## Limitations
 
