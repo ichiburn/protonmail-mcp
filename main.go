@@ -543,6 +543,7 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	addrKR, ok := s.addrKRs[s.addrID]
 	if !ok {
+		releaseSendSlot()
 		return mcp.NewToolResultError("送信者のキーリングが見つかりません。"), nil
 	}
 
@@ -558,6 +559,7 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		},
 	})
 	if err != nil {
+		releaseSendSlot()
 		return mcp.NewToolResultError(fmt.Sprintf("ドラフト作成失敗: %v", err)), nil
 	}
 
