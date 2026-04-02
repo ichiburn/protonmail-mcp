@@ -106,9 +106,9 @@ Search messages by sender, subject, or keyword.
 | `keyword` | No | Keyword (matches against subject) |
 | `limit` | No | Number of results (default: 20) |
 
-### `protonmail_send_message`
+### `protonmail_send_preview`
 
-Send an email. **Requires explicit confirmation** — without `confirm: true`, only a preview is returned.
+Generate a send preview. Returns a `confirm_token` for use with `protonmail_send_confirm`.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
@@ -116,7 +116,14 @@ Send an email. **Requires explicit confirmation** — without `confirm: true`, o
 | `subject` | Yes | Subject line |
 | `body` | Yes | Plain text body |
 | `cc` | No | CC recipient(s), comma-separated |
-| `confirm` | No | `true` to actually send. Default: preview only |
+
+### `protonmail_send_confirm`
+
+Actually send a previewed email. Requires the token from `protonmail_send_preview`.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `confirm_token` | Yes | Token from `protonmail_send_preview` (valid for 5 minutes) |
 
 ## How It Works
 
@@ -127,21 +134,62 @@ Send an email. **Requires explicit confirmation** — without `confirm: true`, o
 
 ## Security Measures
 
+### Adversarial Security Audit
+
+This codebase has been through **8 rounds of adversarial review** using Claude (writer) + OpenAI Codex (reviewer) separation. 24 issues were identified and fixed across all rounds:
+
+| Round | CRITICAL | HIGH | MEDIUM | Issues Fixed |
+|-------|----------|------|--------|-------------|
+| 1 | 3 | 4 | 5 | 3 |
+| 2 | 0 | 2 | 4 | 7 |
+| 3 | 0 | 5 | 0 | 5 |
+| 4 | 0 | 2 | 0 | 2 |
+| 5 | 0 | 0 | 4 | 4 |
+| 6 | 0 | 0 | 2 | 2 |
+| 7 | 0 | 0 | 1 | 1 |
+| **8** | **0** | **0** | **0** | **0** |
+
+Key issues found and fixed include: prompt injection via email content, SRP session leaks on 2FA failure, PGP key material not zeroed, SMTP header injection in address parsing, race conditions in session management, and resource leaks on error paths.
+
 ### Prompt Injection Defense
 
-Email content from `protonmail_read_message` is wrapped with untrusted-content markers and includes a warning instructing the AI not to follow instructions found in email bodies. This mitigates prompt injection attacks where a malicious email tries to trick the AI into sending emails or performing other actions.
+- Email content from `protonmail_read_message` is wrapped with untrusted-content markers and escape sequences
+- A `_warning` field instructs the AI not to follow instructions found in email bodies
+- Delimiter strings within email bodies are escaped to prevent breakout
 
-### Send Confirmation (Dry-Run by Default)
+### Two-Step Send with Server-Side Token
 
-`protonmail_send_message` returns a **preview** by default. The email is only sent when `confirm: true` is explicitly set. This prevents accidental or AI-initiated sends without user approval.
+Sending requires two separate tool calls:
+
+1. `protonmail_send_preview` — generates a preview and returns a cryptographically random `confirm_token` (256-bit)
+2. `protonmail_send_confirm` — requires the token to actually send
+
+This prevents prompt injection attacks from triggering sends — even if a malicious email instructs the AI to send, it cannot guess the confirmation token. Tokens are single-use and expire after 5 minutes.
 
 ### Rate Limiting
 
-Sending is limited to 5 emails per 10-minute window to prevent abuse in case of automated loops.
+Sending is limited to 5 emails per 10-minute window. Rate limit slots are reserved atomically before the send attempt and released on failure.
+
+### Session Management
+
+- Session state is protected by `sync.RWMutex` to prevent data races
+- Reference counting ensures in-flight handlers complete before session teardown
+- Session close has a 30-second timeout to prevent indefinite blocking
+- Re-login properly closes the previous session (client + manager) before creating a new one
 
 ### Credential Handling
 
-Credentials are passed via environment variables and never written to disk by this tool. For production use, consider integrating with a secret manager (`pass`, OS keyring, etc.) instead of storing passwords in `.mcp.json`.
+- Credentials are passed via environment variables — never stored on disk by this tool
+- Password byte slices are zeroed after use
+- Key passphrase material (`saltedKeyPass`) is zeroed immediately after key unlock
+- **Known limitation**: Go strings are immutable and cannot be reliably zeroed in memory. The password string from environment variables persists until GC collection.
+
+### Input Validation
+
+- Message IDs are validated against a strict regex before API calls
+- Email addresses containing CRLF characters are rejected (SMTP header injection prevention)
+- `limit` and `page` parameters are clamped to safe ranges
+- Empty recipient lists are caught before draft creation
 
 ## Limitations
 
