@@ -126,6 +126,9 @@ func main() {
 
 // acquireSession はセッションを安全に取得し、参照カウントを増やす。
 // 使用後は必ず releaseSession を呼ぶこと。
+// 安全性の前提: closeSession() は必ず sessionMu.Lock() 保持下で呼ばれること。
+// RLock 内で closed チェックと refs.Add(1) を行うため、Write Lock 下の
+// closeSession が同時に走ることはない。
 func acquireSession() (*session, error) {
 	sessionMu.RLock()
 	s := sess
@@ -508,28 +511,34 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		return mcp.NewToolResultError("confirm_token は必須です。"), nil
 	}
 
-	// トークンを検証して取り出す（1回限り）
+	// トークンを検証（期限チェック→消費の順で実行）
 	pendingMu.Lock()
 	pending, ok := pendingSends[token]
+	if ok && time.Since(pending.created) > tokenExpiry {
+		// 期限切れ: 消費してエラー
+		delete(pendingSends, token)
+		pendingMu.Unlock()
+		return mcp.NewToolResultError("確認トークンの有効期限が切れています。protonmail_send_preview からやり直してください。"), nil
+	}
 	if ok {
 		delete(pendingSends, token)
 	}
 	pendingMu.Unlock()
 
 	if !ok {
-		return mcp.NewToolResultError("無効または期限切れの確認トークンです。protonmail_send_preview からやり直してください。"), nil
+		return mcp.NewToolResultError("無効な確認トークンです。protonmail_send_preview からやり直してください。"), nil
 	}
 
-	if time.Since(pending.created) > tokenExpiry {
-		return mcp.NewToolResultError("確認トークンの有効期限が切れています。protonmail_send_preview からやり直してください。"), nil
-	}
-
-	// N8対策: レート制限チェック
-	if err := checkSendRateLimit(); err != nil {
+	// F1対策: レート制限チェック+予約をatomicに
+	if err := reserveSendSlot(); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	toList := parseAddresses(pending.to)
+	if len(toList) == 0 {
+		releaseSendSlot()
+		return mcp.NewToolResultError("有効な宛先アドレスがありません。メールアドレスを確認してください。"), nil
+	}
 	ccList := parseAddresses(pending.cc)
 
 	addrKR, ok := s.addrKRs[s.addrID]
@@ -591,21 +600,19 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	// 3. 送信パッケージを構築
 	var sendReq proton.SendDraftReq
 	if err := sendReq.AddTextPackage(addrKR, pending.body, rfc822.TextPlain, prefs, nil); err != nil {
-		// N12対策: ドラフトをクリーンアップ
 		_ = s.client.DeleteMessage(ctx, draft.ID)
+		releaseSendSlot()
 		return mcp.NewToolResultError(fmt.Sprintf("送信パッケージ構築失敗: %v", err)), nil
 	}
 
 	// 4. 送信
 	sent, err := s.client.SendDraft(ctx, draft.ID, sendReq)
 	if err != nil {
-		// N12対策: ドラフトをクリーンアップ
 		_ = s.client.DeleteMessage(ctx, draft.ID)
+		releaseSendSlot()
 		return mcp.NewToolResultError(fmt.Sprintf("送信失敗: %v", err)), nil
 	}
-
-	// N7対策: 送信成功後にレート制限カウンタを増加
-	incrementSendCount()
+	// 成功: 枠はreserveSendSlotで消費済み
 
 	result := map[string]interface{}{
 		"status":  "送信完了",
@@ -676,7 +683,9 @@ func sanitizeEmailBody(body string) string {
 		"\n--- END EMAIL CONTENT (external, untrusted) ---"
 }
 
-func checkSendRateLimit() error {
+// reserveSendSlot はレート制限をチェックし、枠を予約する（atomic操作）。
+// 送信失敗時は releaseSendSlot で枠を返却すること。
+func reserveSendSlot() error {
 	sendMu.Lock()
 	defer sendMu.Unlock()
 
@@ -691,20 +700,17 @@ func checkSendRateLimit() error {
 			int(sendWindow.Minutes()), maxSendsPerWindow)
 	}
 
+	sendCount++
 	return nil
 }
 
-// incrementSendCount は送信成功後にカウンタを増加する。
-func incrementSendCount() {
+// releaseSendSlot は送信失敗時に予約した枠を返却する。
+func releaseSendSlot() {
 	sendMu.Lock()
 	defer sendMu.Unlock()
-
-	now := time.Now()
-	if now.Sub(sendWindowStart) > sendWindow {
-		sendCount = 0
-		sendWindowStart = now
+	if sendCount > 0 {
+		sendCount--
 	}
-	sendCount++
 }
 
 // --- helpers ---
