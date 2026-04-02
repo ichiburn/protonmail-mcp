@@ -151,15 +151,28 @@ func releaseSession(s *session) {
 
 // closeSession は既存セッションを安全にクローズする。sessionMu.Lock() を保持して呼ぶこと。
 // acquireSession は RLock を使うため、ここで Wait() してもデッドロックしない。
+// N-R7-3対策: ハンドラがハングした場合に備えてタイムアウトを設ける。
 func closeSession() {
 	if sess != nil {
 		old := sess
 		old.closed = true
 		sess = nil
-		// ロック内で同期的にクローズ（N14対策）
-		// acquireSession は RLock なので Write Lock 中はブロックされる。
-		// 既にacquire済みのハンドラは Done() を呼ぶので Wait() は有限時間で完了。
-		old.refs.Wait()
+
+		// タイムアウト付きでハンドラの完了を待つ
+		done := make(chan struct{})
+		go func() {
+			old.refs.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// 全ハンドラが正常に完了
+		case <-time.After(30 * time.Second):
+			// タイムアウト: ハンドラがハングしている可能性。強制的にクローズを続行。
+			log.Println("warning: closeSession timed out waiting for handlers, forcing close")
+		}
+
 		if old.client != nil {
 			old.client.Close()
 		}
