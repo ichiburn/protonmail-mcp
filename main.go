@@ -147,16 +147,16 @@ func releaseSession(s *session) {
 }
 
 // closeSession は既存セッションを安全にクローズする。sessionMu.Lock() を保持して呼ぶこと。
-// 全ハンドラがセッションを解放するまで待ってからクローズする。
+// acquireSession は RLock を使うため、ここで Wait() してもデッドロックしない。
 func closeSession() {
 	if sess != nil {
-		sess.closed = true
 		old := sess
+		old.closed = true
 		sess = nil
-		// ロックを一時解放して待機（デッドロック防止）
-		sessionMu.Unlock()
+		// ロック内で同期的にクローズ（N14対策）
+		// acquireSession は RLock なので Write Lock 中はブロックされる。
+		// 既にacquire済みのハンドラは Done() を呼ぶので Wait() は有限時間で完了。
 		old.refs.Wait()
-		sessionMu.Lock()
 		if old.client != nil {
 			old.client.Close()
 		}
@@ -195,44 +195,50 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		proton.WithAppVersion("Other"),
 	)
 
+	// N13対策: ログイン成功するまで mgr と c を defer でクリーンアップ
+	loginSuccess := false
+	defer func() {
+		if !loginSuccess {
+			mgr.Close()
+		}
+	}()
+
 	c, auth, err := mgr.NewClientWithLogin(ctx, username, passBytes)
 	if err != nil {
 		return mcp.NewToolResultError("ログイン失敗。認証情報を確認してください。"), nil
 	}
+	defer func() {
+		if !loginSuccess {
+			c.Close()
+		}
+	}()
 
 	if auth.TwoFA.Enabled&proton.HasTOTP != 0 {
 		if totp == "" {
-			c.Close()
 			return mcp.NewToolResultError("2FAが有効です。totp パラメータに認証コードを指定してください。"), nil
 		}
 		if err := c.Auth2FA(ctx, proton.Auth2FAReq{TwoFactorCode: totp}); err != nil {
-			c.Close()
 			return mcp.NewToolResultError("2FA認証失敗。コードを確認してください。"), nil
 		}
 	}
 
-	// ここからはエラー時にクライアントをクリーンアップする
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		c.Close()
 		return mcp.NewToolResultError("ユーザー情報取得失敗。再試行してください。"), nil
 	}
 
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		c.Close()
 		return mcp.NewToolResultError("Salt取得失敗。再試行してください。"), nil
 	}
 
 	addrs, err := c.GetAddresses(ctx)
 	if err != nil {
-		c.Close()
 		return mcp.NewToolResultError("アドレス取得失敗。再試行してください。"), nil
 	}
 
 	saltedKeyPass, err := salts.SaltForKey(passBytes, user.Keys.Primary().ID)
 	if err != nil {
-		c.Close()
 		return mcp.NewToolResultError("鍵パスフレーズ導出失敗。再試行してください。"), nil
 	}
 
@@ -244,7 +250,6 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 
 	if err != nil {
-		c.Close()
 		return mcp.NewToolResultError("キーリングアンロック失敗。再試行してください。"), nil
 	}
 
@@ -266,6 +271,7 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		addr:    sAddr,
 		addrID:  sAddrID,
 	}
+	loginSuccess = true // defer でのクリーンアップを抑制
 	sessionMu.Unlock()
 
 	return mcp.NewToolResultText(fmt.Sprintf("ログイン成功: %s (%s)", user.Name, user.Email)), nil
