@@ -10,7 +10,7 @@ An MCP (Model Context Protocol) server for ProtonMail. Read, search, and send em
 - **List messages** — Browse inbox, sent, drafts, trash, spam, archive
 - **Read messages** — Decrypt and read PGP-encrypted email bodies
 - **Search messages** — Filter by sender, subject, keyword
-- **Send messages** — Compose and send emails (auto-encrypts for Proton-to-Proton)
+- **Send messages** — Compose and send emails with attachments (auto-encrypts for Proton-to-Proton)
 
 ## Security
 
@@ -116,6 +116,7 @@ Generate a send preview. Returns a `confirm_token` for use with `protonmail_send
 | `subject` | Yes | Subject line |
 | `body` | Yes | Plain text body |
 | `cc` | No | CC recipient(s), comma-separated |
+| `attachments` | No | File path(s), comma-separated (max 20 files, 25MB total) |
 
 ### `protonmail_send_confirm`
 
@@ -191,9 +192,17 @@ Sending is limited to 5 emails per 10-minute window. Rate limit slots are reserv
 - `limit` and `page` parameters are clamped to safe ranges
 - Empty recipient lists are caught before draft creation
 
+### Attachment Security
+
+- File paths are validated with symlink resolution (`filepath.EvalSymlinks`) and path traversal prevention
+- Sensitive files are blocked (`.env`, `.ssh/`, `.aws/`, `.gnupg/`, shell configs, etc.)
+- Per-file limit: 25MB, total limit: 25MB, max 20 attachments
+- Attachments are PGP-encrypted and signed before upload
+- File validation is performed at both preview and send time (TOCTOU protection)
+
 ## Limitations
 
-- Attachment download/upload not yet supported
+- Attachment download not yet supported (upload/send works)
 - HTML email composition not yet supported (plain text only)
 - No event streaming / real-time notifications
 - ProtonMail API is not officially documented — endpoints may change
