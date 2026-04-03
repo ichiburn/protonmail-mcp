@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/mail"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -49,10 +51,11 @@ var (
 )
 
 type pendingSend struct {
-	to      string
-	cc      string
-	subject string
-	body    string
+	to          string
+	cc          string
+	subject     string
+	body        string
+	attachments []string // ファイルパスのリスト
 	created time.Time
 }
 
@@ -112,6 +115,7 @@ func main() {
 		mcp.WithString("subject", mcp.Required(), mcp.Description("件名")),
 		mcp.WithString("body", mcp.Required(), mcp.Description("本文（プレーンテキスト）")),
 		mcp.WithString("cc", mcp.Description("CCメールアドレス（カンマ区切り）")),
+		mcp.WithString("attachments", mcp.Description("添付ファイルパス（カンマ区切りで複数可）")),
 	), sendPreviewHandler)
 
 	s.AddTool(mcp.NewTool("protonmail_send_confirm",
@@ -466,9 +470,30 @@ func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	subject := stringArg(req, "subject")
 	body := stringArg(req, "body")
 	cc := stringArg(req, "cc")
+	attachmentsStr := stringArg(req, "attachments")
 
 	if to == "" || subject == "" || body == "" {
 		return mcp.NewToolResultError("to, subject, body は必須です。"), nil
+	}
+
+	// 添付ファイルの検証
+	var attachments []string
+	if attachmentsStr != "" {
+		parts := strings.Split(attachmentsStr, ",")
+		if len(parts) > maxAttachmentCount {
+			return mcp.NewToolResultError(fmt.Sprintf("添付ファイル数が上限（%d個）を超えています。", maxAttachmentCount)), nil
+		}
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			validPath, err := validateAttachmentPath(p)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("添付ファイルエラー: %s: %v", p, err)), nil
+			}
+			attachments = append(attachments, validPath)
+		}
 	}
 
 	// N3対策: pending上限チェック
@@ -486,11 +511,12 @@ func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	}
 
 	pendingSends[token] = &pendingSend{
-		to:      to,
-		cc:      cc,
-		subject: subject,
-		body:    body,
-		created: time.Now(),
+		to:          to,
+		cc:          cc,
+		subject:     subject,
+		body:        body,
+		attachments: attachments,
+		created:     time.Now(),
 	}
 	pendingMu.Unlock()
 
@@ -501,6 +527,7 @@ func sendPreviewHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		"cc":            cc,
 		"subject":       subject,
 		"body":          body,
+		"attachments":   attachments,
 		"confirm_token": token,
 		"expires_in":    fmt.Sprintf("%d分", int(tokenExpiry.Minutes())),
 		"_notice":       "これはプレビューです。実際に送信するには、ユーザーの承認を得た上で protonmail_send_confirm に confirm_token を渡してください。",
@@ -576,7 +603,64 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		return mcp.NewToolResultError(fmt.Sprintf("ドラフト作成失敗: %v", err)), nil
 	}
 
-	// 2. 各宛先のSendPreferencesを構築
+	// 2. 添付ファイルのアップロード
+	attKeys := make(map[string]*crypto.SessionKey)
+	var totalAttSize int64
+	if len(pending.attachments) > 0 {
+		for _, filePath := range pending.attachments {
+			// 送信時に再検証（TOCTOU対策）
+			validPath, err := validateAttachmentPath(filePath)
+			if err != nil {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付ファイルエラー: %s: %v", filePath, err)), nil
+			}
+			fileData, err := os.ReadFile(validPath)
+			if err != nil {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付ファイル読み込み失敗: %s: %v", filePath, err)), nil
+			}
+			totalAttSize += int64(len(fileData))
+			if totalAttSize > maxTotalAttSize {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付ファイルの合計サイズが上限（25MB）を超えています")), nil
+			}
+
+			mimeType := detectMIMEType(filePath)
+			att, err := s.client.UploadAttachment(ctx, addrKR, proton.CreateAttachmentReq{
+				MessageID:   draft.ID,
+				Filename:    filepath.Base(filePath),
+				MIMEType:    rfc822.MIMEType(mimeType),
+				Disposition: proton.AttachmentDisposition,
+				Body:        fileData,
+			})
+			if err != nil {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付アップロード失敗: %s: %v", filePath, err)), nil
+			}
+
+			// 添付のセッションキーを復号して保存（失敗は致命的エラー）
+			kpBytes, err := base64.StdEncoding.DecodeString(att.KeyPackets)
+			if err != nil {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付キーパケット復号失敗: %s: %v", filePath, err)), nil
+			}
+			sk, err := addrKR.DecryptSessionKey(kpBytes)
+			if err != nil {
+				_ = s.client.DeleteMessage(ctx, draft.ID)
+				releaseSendSlot()
+				return mcp.NewToolResultError(fmt.Sprintf("添付セッションキー復号失敗: %s: %v", filePath, err)), nil
+			}
+			attKeys[att.ID] = sk
+			fileData = nil // メモリ解放を促す
+		}
+	}
+
+	// 3. 各宛先のSendPreferencesを構築
 	allRecipients := make([]*mail.Address, 0, len(toList)+len(ccList))
 	allRecipients = append(allRecipients, toList...)
 	allRecipients = append(allRecipients, ccList...)
@@ -614,7 +698,7 @@ func sendConfirmHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	// 3. 送信パッケージを構築
 	var sendReq proton.SendDraftReq
-	if err := sendReq.AddTextPackage(addrKR, pending.body, rfc822.TextPlain, prefs, nil); err != nil {
+	if err := sendReq.AddTextPackage(addrKR, pending.body, rfc822.TextPlain, prefs, attKeys); err != nil {
 		_ = s.client.DeleteMessage(ctx, draft.ID)
 		releaseSendSlot()
 		return mcp.NewToolResultError(fmt.Sprintf("送信パッケージ構築失敗: %v", err)), nil
@@ -696,6 +780,100 @@ func sanitizeEmailBody(body string) string {
 	return "--- BEGIN EMAIL CONTENT (external, untrusted) ---\n" +
 		body +
 		"\n--- END EMAIL CONTENT (external, untrusted) ---"
+}
+
+const (
+	maxAttachmentSize  = 25 * 1024 * 1024  // 25MB per file
+	maxTotalAttSize    = 25 * 1024 * 1024  // 25MB total
+	maxAttachmentCount = 20                // max files per email
+)
+
+// validateAttachmentPath はファイルパスのセキュリティ検証を行う。
+// パストラバーサル、シンボリックリンク、サイズ制限を検証。
+func validateAttachmentPath(path string) (string, error) {
+	// 絶対パスに変換
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("パス解決失敗: %w", err)
+	}
+
+	// シンボリックリンクを解決
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", fmt.Errorf("ファイルが見つかりません: %w", err)
+	}
+
+	// 正規化後に ".." セグメントが残っていないことを確認
+	for _, part := range strings.Split(realPath, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("不正なパスです")
+		}
+	}
+
+	// ファイル情報を取得
+	fi, err := os.Stat(realPath)
+	if err != nil {
+		return "", fmt.Errorf("ファイルが見つかりません: %w", err)
+	}
+
+	// 通常ファイルであることを確認
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("通常ファイルではありません")
+	}
+
+	// サイズ制限
+	if fi.Size() > maxAttachmentSize {
+		return "", fmt.Errorf("ファイルサイズが上限（25MB）を超えています: %d bytes", fi.Size())
+	}
+
+	// 機密ファイルのブロック
+	sensitivePatterns := []string{
+		"/etc/", "/proc/", "/sys/", "/dev/", "/var/run/", "/run/",
+		".env", ".ssh/", "id_rsa", "id_ed25519",
+		".gnupg/", ".aws/", ".kube/", ".gitconfig",
+		".bashrc", ".zshrc", ".profile", ".bash_profile",
+		"credentials", ".protonmail", ".claude/",
+	}
+	lowerPath := strings.ToLower(realPath)
+	for _, pattern := range sensitivePatterns {
+		if strings.Contains(lowerPath, pattern) {
+			return "", fmt.Errorf("セキュリティポリシーによりアクセスが拒否されました")
+		}
+	}
+
+	return realPath, nil
+}
+
+func detectMIMEType(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".pdf":
+		return "application/pdf"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	case ".csv":
+		return "text/csv"
+	case ".zip":
+		return "application/zip"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // reserveSendSlot はレート制限をチェックし、枠を予約する（atomic操作）。
