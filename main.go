@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -60,6 +64,12 @@ type pendingSend struct {
 }
 
 const (
+	// appName / appVersion はツールの正直な自己申告。x-pm-appversion ヘッダ（AppVersion）と
+	// MCPサーバー宣言の両方で使い、二重管理を避ける（Single Source of Truth）。
+	// 公式クライアント（web-mail 等）を偽装せず、go-proton-api ベースの非公式ツールだと名乗る。
+	appName    = "protonmail-mcp"
+	appVersion = "0.1.0"
+
 	maxSendsPerWindow = 5               // ウィンドウ内の最大送信数
 	sendWindow        = 10 * time.Minute // レート制限ウィンドウ
 	tokenExpiry       = 5 * time.Minute  // 確認トークンの有効期限
@@ -76,16 +86,13 @@ func init() {
 
 func main() {
 	s := server.NewMCPServer(
-		"protonmail",
-		"0.1.0",
+		appName,
+		appVersion,
 		server.WithToolCapabilities(true),
 	)
 
 	s.AddTool(mcp.NewTool("protonmail_login",
-		mcp.WithDescription("ProtonMailにログインする。環境変数 PROTON_USER / PROTON_PASS が設定されていればそれを使う。"),
-		mcp.WithString("username", mcp.Description("ProtonMailユーザー名（環境変数未設定時）")),
-		mcp.WithString("password", mcp.Description("ProtonMailパスワード（環境変数未設定時）")),
-		mcp.WithString("totp", mcp.Description("2FAコード（有効な場合）")),
+		mcp.WithDescription("ProtonMailにログインする。認証情報はサーバープロセスの環境変数（PROTON_USER / PROTON_PASS、2FA有効時は PROTON_TOTP_SECRET）からのみ読み込む。セキュリティ上、ツール引数では認証情報を受け付けない。"),
 	), loginHandler)
 
 	s.AddTool(mcp.NewTool("protonmail_list_messages",
@@ -187,17 +194,12 @@ func closeSession() {
 }
 
 func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	username := stringArg(req, "username")
-	passStr := stringArg(req, "password")
-
-	if username == "" {
-		username = os.Getenv("PROTON_USER")
-	}
-	if passStr == "" {
-		passStr = os.Getenv("PROTON_PASS")
-	}
+	// セキュリティ: 認証情報は環境変数からのみ読み込む。
+	// ツール引数では受け付けない（生パスワードがエージェントのコンテキストに載るのを防ぐ）。
+	username := os.Getenv("PROTON_USER")
+	passStr := os.Getenv("PROTON_PASS")
 	if username == "" || passStr == "" {
-		return mcp.NewToolResultError("username/password が必要です。引数か環境変数 PROTON_USER/PROTON_PASS を設定してください。"), nil
+		return mcp.NewToolResultError("認証情報が未設定です。サーバープロセスの環境変数 PROTON_USER と PROTON_PASS を設定してください。"), nil
 	}
 
 	// N5対策: パスワードをできるだけ早く[]byteに変換し、使用後にゼロ埋め
@@ -208,11 +210,10 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		}
 	}()
 
-	totp := stringArg(req, "totp")
-
 	mgr := proton.New(
 		proton.WithHostURL("https://mail.proton.me/api"),
-		proton.WithAppVersion("Other"),
+		// 公式クライアントを偽装せず、ツールを正直に名乗る（name@version 形式）。
+		proton.WithAppVersion(appName+"@"+appVersion),
 	)
 
 	// N13対策: ログイン成功するまで mgr と c を defer でクリーンアップ
@@ -225,7 +226,7 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 
 	c, auth, err := mgr.NewClientWithLogin(ctx, username, passBytes)
 	if err != nil {
-		return mcp.NewToolResultError("ログイン失敗。認証情報を確認してください。"), nil
+		return mcp.NewToolResultError("ログイン失敗。認証情報、またはProton側のアカウント制限（一時的なアクセス制限など）を確認してください。"), nil
 	}
 	defer func() {
 		if !loginSuccess {
@@ -234,11 +235,16 @@ func loginHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}()
 
 	if auth.TwoFA.Enabled&proton.HasTOTP != 0 {
-		if totp == "" {
-			return mcp.NewToolResultError("2FAが有効です。totp パラメータに認証コードを指定してください。"), nil
+		totpSeed := os.Getenv("PROTON_TOTP_SECRET")
+		if totpSeed == "" {
+			return mcp.NewToolResultError("2FAが有効ですが PROTON_TOTP_SECRET が未設定です。Base32形式のTOTPシードを環境変数に設定してください。"), nil
 		}
-		if err := c.Auth2FA(ctx, proton.Auth2FAReq{TwoFactorCode: totp}); err != nil {
-			return mcp.NewToolResultError("2FA認証失敗。コードを確認してください。"), nil
+		code, err := generateTOTPCode(totpSeed, time.Now())
+		if err != nil {
+			return mcp.NewToolResultError("TOTPコード生成失敗。PROTON_TOTP_SECRET の形式（Base32）を確認してください。"), nil
+		}
+		if err := c.Auth2FA(ctx, proton.Auth2FAReq{TwoFactorCode: code}); err != nil {
+			return mcp.NewToolResultError("2FA認証失敗。PROTON_TOTP_SECRET を確認してください。"), nil
 		}
 	}
 
@@ -762,6 +768,45 @@ func generateToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// generateTOTPCode は Base32 シークレットから RFC6238 準拠の6桁TOTPコードを生成する。
+// SHA1・30秒ステップ（ProtonMail を含む一般的な Authenticator アプリの標準設定）。
+// シークレットはサーバープロセスの環境変数からのみ渡され、エージェントのコンテキストには載らない。
+func generateTOTPCode(secret string, t time.Time) (string, error) {
+	// Authenticator アプリ表示のシークレットは空白・小文字・パディング省略があり得るため正規化する
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(secret), " ", ""))
+	if normalized == "" {
+		return "", fmt.Errorf("空のTOTPシークレット")
+	}
+	if m := len(normalized) % 8; m != 0 {
+		normalized += strings.Repeat("=", 8-m)
+	}
+	key, err := base32.StdEncoding.DecodeString(normalized)
+	if err != nil {
+		return "", fmt.Errorf("base32デコード失敗: %w", err)
+	}
+	if len(key) == 0 {
+		return "", fmt.Errorf("デコード後のキーが空")
+	}
+
+	counter := uint64(t.Unix()) / 30
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], counter)
+
+	h := hmac.New(sha1.New, key)
+	h.Write(buf[:])
+	sum := h.Sum(nil)
+
+	// RFC4226 dynamic truncation
+	offset := sum[len(sum)-1] & 0x0f
+	code := (uint32(sum[offset])&0x7f)<<24 |
+		uint32(sum[offset+1])<<16 |
+		uint32(sum[offset+2])<<8 |
+		uint32(sum[offset+3])
+	code %= 1000000
+
+	return fmt.Sprintf("%06d", code), nil
 }
 
 // cleanExpiredTokens removes expired pending sends. Must be called with pendingMu held.

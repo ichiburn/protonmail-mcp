@@ -48,33 +48,33 @@ Add to your `.mcp.json`:
       "command": "protonmail-mcp",
       "env": {
         "PROTON_USER": "your-email@proton.me",
-        "PROTON_PASS": "your-password"
+        "PROTON_PASS": "your-password",
+        "PROTON_TOTP_SECRET": "your-base32-totp-secret"
       }
     }
   }
 }
 ```
 
-Or pass credentials at login time instead of storing them in config.
+**Credentials are read from environment variables only** — never from tool arguments. This keeps your password and TOTP secret out of the AI agent's context, chat history, and logs. To avoid storing secrets in `.mcp.json`, export them in the shell that launches the MCP client instead. `PROTON_TOTP_SECRET` is only needed if 2FA is enabled.
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PROTON_USER` | ProtonMail email address |
-| `PROTON_PASS` | ProtonMail password |
+| `PROTON_USER` | ProtonMail email address (required) |
+| `PROTON_PASS` | ProtonMail password (required) |
+| `PROTON_TOTP_SECRET` | Base32 TOTP secret, only if 2FA is enabled. The server derives the 6-digit code locally (RFC6238) — you never type a per-login code. |
 
 ## Tools
 
 ### `protonmail_login`
 
-Authenticate with ProtonMail. Uses environment variables or explicit parameters.
+Authenticate with ProtonMail. **Takes no arguments** — credentials are read exclusively from the environment variables `PROTON_USER`, `PROTON_PASS`, and (if 2FA is enabled) `PROTON_TOTP_SECRET`. Tool arguments are intentionally not accepted so that the password and TOTP secret never enter the AI agent's context.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `username` | No | Email address (falls back to `PROTON_USER`) |
-| `password` | No | Password (falls back to `PROTON_PASS`) |
-| `totp` | No | 2FA code if TOTP is enabled |
+| _(none)_ | — | All credentials come from environment variables |
 
 ### `protonmail_list_messages`
 
@@ -133,6 +133,10 @@ Actually send a previewed email. Requires the token from `protonmail_send_previe
 3. **Reading**: Encrypted message bodies are decrypted with the user's keyring via `gopenpgp`
 4. **Sending**: Messages are encrypted with recipient's public key (Proton-to-Proton) or sent in clear (external)
 
+### Honest client identification
+
+The `x-pm-appversion` header is set to **`protonmail-mcp@<version>`** — this tool identifies itself honestly rather than impersonating an official Proton client (e.g. `web-mail`). Spoofing a first-party client would violate community norms and Proton's terms; naming the tool truthfully is the expected practice for a `go-proton-api`-based project.
+
 ## Security Measures
 
 ### Adversarial Security Audit
@@ -180,10 +184,11 @@ Sending is limited to 5 emails per 10-minute window. Rate limit slots are reserv
 
 ### Credential Handling
 
-- Credentials are passed via environment variables — never stored on disk by this tool
+- **Credentials are read from environment variables only — never accepted as tool arguments.** This prevents the password and TOTP secret from entering the AI agent's context, chat transcript, or logs (the original threat that motivated this design).
+- 2FA codes are derived **server-side** from `PROTON_TOTP_SECRET` (RFC6238, SHA1, 30s step) — no per-login code is passed through the agent.
 - Password byte slices are zeroed after use
 - Key passphrase material (`saltedKeyPass`) is zeroed immediately after key unlock
-- **Known limitation**: Go strings are immutable and cannot be reliably zeroed in memory. The password string from environment variables persists until GC collection.
+- **Known limitation**: Go strings are immutable and cannot be reliably zeroed in memory. The password and TOTP secret strings from environment variables persist until GC collection.
 
 ### Input Validation
 
