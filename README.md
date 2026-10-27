@@ -6,9 +6,10 @@ An MCP (Model Context Protocol) server for ProtonMail. Read, search, and send em
 
 ## Features
 
-- **Login** — SRP authentication with 2FA (TOTP) support
+- **One-time CLI Login (OS Keychain)** — Run `protonmail-mcp login` once; no plaintext passwords or TOTP secrets in `.mcp.json`
+- **Login & Auto-Refresh** — SRP authentication with 2FA (TOTP) support and automatic refresh token rotation
 - **List messages** — Browse inbox, sent, drafts, trash, spam, archive
-- **Read messages** — Decrypt and read PGP-encrypted email bodies
+- **Read messages** — Decrypt and read PGP-encrypted email bodies locally
 - **Search messages** — Filter by sender, subject, keyword
 - **Send messages** — Compose and send emails with attachments (auto-encrypts for Proton-to-Proton)
 
@@ -18,8 +19,8 @@ An MCP (Model Context Protocol) server for ProtonMail. Read, search, and send em
   - [go-proton-api](https://github.com/ProtonMail/go-proton-api) — API client (used by Proton Bridge)
   - [go-srp](https://github.com/ProtonMail/go-srp) — SRP authentication
   - [gopenpgp](https://github.com/ProtonMail/gopenpgp) — OpenPGP encryption/decryption
-- Credentials are passed via environment variables — never stored on disk
-- All encryption/decryption happens locally
+- **Zero passwords in `.mcp.json`** — One-time `protonmail-mcp login` derives your PGP key passphrase (`saltedKeyPass`), wipes the plaintext password from memory (`ZeroBytes`), and stores only the refresh token (`UID` / `RefreshToken`) and `saltedKeyPass` in your OS keychain ([zalando/go-keyring](https://github.com/zalando/go-keyring): macOS Keychain, Linux Secret Service, Windows Credential Manager; or a strict `0600` file fallback on headless Linux)
+- All PGP encryption and decryption happens locally
 
 ## Install
 
@@ -37,9 +38,50 @@ go build -o protonmail-mcp .
 
 ## Setup
 
-### Claude Code
+### Recommended: One-time CLI Login (OS Keychain — no passwords in `.mcp.json`)
 
-Add to your `.mcp.json`:
+ProtonMail uses zero-knowledge end-to-end PGP encryption, which means standard web OAuth tokens alone cannot unlock your private PGP keys to decrypt email bodies. Instead of putting your password in `.mcp.json`, run `protonmail-mcp login` once in your terminal:
+
+```bash
+protonmail-mcp login
+# ProtonMail Email: your-email@proton.me
+# Password: ********
+# 2FA TOTP Code (6 digits) or Base32 Secret: 123456
+```
+
+What happens during `protonmail-mcp login`:
+1. Performs SRP authentication (`NewClientWithLogin` + `Auth2FA`) and derives the salted PGP key passphrase (`salts.SaltForKey`).
+2. Verifies local PGP keyring unlock (`proton.Unlock`) and immediately zeroes the raw password bytes in memory.
+3. Saves only `UID`, `RefreshToken`, and `saltedKeyPass` into the **OS keychain** (macOS Keychain / Linux Secret Service / Windows Credential Manager). On headless Linux systems without a keyring daemon, it falls back to `~/.config/protonmail-mcp/credentials.json` with enforced `0700` directory and `0600` file permissions (refusing to load if group/world permissions are present).
+
+Then configure `.mcp.json` **without any `env` credentials**:
+
+```json
+{
+  "mcpServers": {
+    "protonmail": {
+      "command": "protonmail-mcp"
+    }
+  }
+}
+```
+
+When the MCP server starts, it automatically restores the session via `NewClientWithRefresh`, unlocks your PGP keyring locally, and rotates the refresh token in the OS keychain whenever `go-proton-api` refreshes authentication.
+
+#### CLI Commands
+
+```bash
+protonmail-mcp login              # Interactive one-time login (saves to OS keychain)
+protonmail-mcp status             # Check stored credentials & verify session online
+protonmail-mcp status --offline   # Check stored credentials without making API calls
+protonmail-mcp logout             # Revoke server session & delete stored credentials
+```
+
+---
+
+### Alternative (Legacy / Fallback): Environment Variables
+
+If you prefer stateless configuration without the OS keychain, you can still pass credentials via environment variables:
 
 ```json
 {
@@ -56,25 +98,22 @@ Add to your `.mcp.json`:
 }
 ```
 
-**Credentials are read from environment variables only** — never from tool arguments. This keeps your password and TOTP secret out of the AI agent's context, chat history, and logs. To avoid storing secrets in `.mcp.json`, export them in the shell that launches the MCP client instead. `PROTON_TOTP_SECRET` is only needed if 2FA is enabled.
-
-### Environment Variables
-
 | Variable | Description |
 |----------|-------------|
-| `PROTON_USER` | ProtonMail email address (required) |
-| `PROTON_PASS` | ProtonMail password (required) |
-| `PROTON_TOTP_SECRET` | Base32 TOTP secret, only if 2FA is enabled. The server derives the 6-digit code locally (RFC6238) — you never type a per-login code. |
+| `PROTON_USER` | ProtonMail email address |
+| `PROTON_PASS` | ProtonMail password |
+| `PROTON_TOTP_SECRET` | Base32 TOTP secret, only if 2FA is enabled. The server derives the 6-digit code locally (RFC6238). |
+| `PROTON_MCP_CRED_FILE` | Optional custom path for the `0600` fallback credential file (default: `~/.config/protonmail-mcp/credentials.json`) |
 
 ## Tools
 
 ### `protonmail_login`
 
-Authenticate with ProtonMail. **Takes no arguments** — credentials are read exclusively from the environment variables `PROTON_USER`, `PROTON_PASS`, and (if 2FA is enabled) `PROTON_TOTP_SECRET`. Tool arguments are intentionally not accepted so that the password and TOTP secret never enter the AI agent's context.
+Authenticate or refresh the ProtonMail session. **Takes no arguments** — it first restores your saved session from the OS keychain (created via `protonmail-mcp login`), or falls back to `PROTON_USER`, `PROTON_PASS`, and `PROTON_TOTP_SECRET` environment variables if no keychain session exists. Tool arguments are never accepted so credentials never enter the AI agent's context.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| _(none)_ | — | All credentials come from environment variables |
+| _(none)_ | — | Restores from OS keychain or reads environment variables |
 
 ### `protonmail_list_messages`
 
@@ -128,8 +167,8 @@ Actually send a previewed email. Requires the token from `protonmail_send_previe
 
 ## How It Works
 
-1. **Authentication**: SRP (Secure Remote Password) protocol via Proton's official `go-srp` library
-2. **Key management**: User's PGP private key is decrypted locally with the mailbox password
+1. **Authentication**: One-time SRP (Secure Remote Password) login via `protonmail-mcp login` (using Proton's `go-srp`), followed by token-based session restoration (`NewClientWithRefresh`) and automatic token rotation (`AddAuthHandler`)
+2. **Key management**: User's PGP private key is decrypted locally with the derived `saltedKeyPass` stored in the OS keychain
 3. **Reading**: Encrypted message bodies are decrypted with the user's keyring via `gopenpgp`
 4. **Sending**: Messages are encrypted with recipient's public key (Proton-to-Proton) or sent in clear (external)
 
@@ -184,11 +223,9 @@ Sending is limited to 5 emails per 10-minute window. Rate limit slots are reserv
 
 ### Credential Handling
 
-- **Credentials are read from environment variables only — never accepted as tool arguments.** This prevents the password and TOTP secret from entering the AI agent's context, chat transcript, or logs (the original threat that motivated this design).
-- 2FA codes are derived **server-side** from `PROTON_TOTP_SECRET` (RFC6238, SHA1, 30s step) — no per-login code is passed through the agent.
-- Password byte slices are zeroed after use
-- Key passphrase material (`saltedKeyPass`) is zeroed immediately after key unlock
-- **Known limitation**: Go strings are immutable and cannot be reliably zeroed in memory. The password and TOTP secret strings from environment variables persist until GC collection.
+- **OS Keychain first (recommended)**: `protonmail-mcp login` reads credentials interactively from the terminal (with echo disabled), derives `saltedKeyPass`, and persists only `UID`, `RefreshToken`, and `saltedKeyPass` to the OS keychain (or a `0600`-enforced file on headless systems). No plaintext password or TOTP secret is stored on disk or in `.mcp.json`.
+- **Never accepted as tool arguments**: Credentials are never passed through MCP tool arguments, keeping secrets out of the AI agent's context, chat transcript, and logs.
+- **Memory hygiene**: Password byte slices and `saltedKeyPass` buffers are zeroed (`auth.ZeroBytes`) immediately after key derivation or keyring unlock.
 
 ### Input Validation
 
